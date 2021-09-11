@@ -1,0 +1,181 @@
+#!/usr/bin/env luajit
+
+local exec	= os.execute
+local tmpname	= os.tmpname
+local rm	= os.remove
+local open	= io.open
+local lines	= io.lines
+local insert 	= table.insert
+local format	= string.format
+
+local LIST_DIR_ERROR = "Error listing directories. Status: %d"
+local PKG_FIND_ERROR = "Failed to identify package \"%s\""
+local REPO_NAME = 
+local REPO_PATH = 
+local PKG_RE = ".*.*.pkg%.tar%.zst"
+
+local FILE_CLEANUP = { }
+
+local function printf(base, ...)
+	print(format(base, ...))
+end
+
+local function print_error(base, ...)
+	print(format('\27[1;31m%s\27[0m', base:format(...)))
+end
+
+local function fexec(base, ...)
+	return exec(base:format(...))
+end
+
+local function cmd(base, ...)
+	local stdout = tmpname()
+	local rc = fexec("%s > %s", base:format(...), stdout)
+
+	local stdout_file = open(stdout, 'r')
+	local output = stdout_file:read("*a")
+	stdout_file:close()
+	rm(stdout)
+
+	return rc, output
+end
+
+local function cp(src, dest)
+	return cmd("cp %s %s", src, dest)
+end
+
+local function makepkg(path)
+	return cmd("makepkg %s", path)
+end
+
+local function repo_add(db_path, pkg_path)
+	return cmd("repo-add %s %s", db_path, pkg_path)
+end
+
+local function dir_iter(path)
+	local exec_output = tmpname()
+	insert(FILE_CLEANUP, exec_output)
+
+	local find_dirs = "find %s -maxdepth 1 -mindepth 1 -type d > %s"
+	local rc = fexec(find_dirs, path, exec_output)
+
+	if rc ~= 0 then
+		print_error(LIST_DIR_ERROR, rc)
+	end
+
+	return lines(exec_output)
+end
+
+local function file_iter(path)
+	local exec_output = tmpname()
+	insert(FILE_CLEANUP, exec_output)
+
+	local find_files = "find %s -maxdepth 1 -mindepth 1 -type f > %s"
+	local rc = fexec(find_files, path, exec_output)
+	return lines(exec_output)
+end
+
+local function is_full_match(string, pattern)
+	local s, e = string:find(pattern)
+	if s == nil then
+		return false
+	end
+
+	return (s == 1) and (e == #string)
+end
+
+local function basename(path)
+	local index = #path
+	while index > 0 do
+		if path:sub(index, index) == '/' then
+			return path:sub(index + 1)
+		end
+		index = index - 1
+	end
+
+	return path
+end
+
+local function join(path1, path2)
+	local function char_at(str, pos)
+		return str:sub(pos, pos)
+	end
+
+	if char_at(path1, #path1) == '/' and char_at(path2, 1) == '/' then
+		return path1 .. path2:sub(2)
+	end
+
+	if char_at(path1, #path1) == '/' or char_at(path2, 1) == '/' then
+		return path1 .. path2
+	end
+		
+	return path1 .. '/' .. path2
+end
+
+local function regex_escape(string)
+	return string:gsub("([%^%$%(%)%%%.%[%]%*%+%-%?])", "%%%1")
+end
+
+local function make_pkg_name_re(name)
+	return ".*" .. name .. '/' .. name .. ".*%.pkg%.tar%.zst"
+end
+
+local function main()
+	local function get_package_directories(repo_path)
+		local package_directories = { }
+
+		for dir in dir_iter(repo_path) do
+			insert(package_directories, dir)
+		end
+
+		return package_directories
+	end
+
+	local function extract_pkgs(package_directories, repo_path)
+		for _, pkg_dir_path in ipairs(package_directories) do
+			local pkg_name = basename(pkg_dir_path)
+			
+			local match_count = 0
+			local pkg_path = nil
+			local e_name = regex_escape(pkg_name)
+			local pattern = make_pkg_name_re(e_name)
+			for file in file_iter(pkg_dir_path) do
+				if is_full_match(file, pattern) then
+					match_count = match_count + 1
+					pkg_path = file
+				end
+			end
+
+			if pkg_path == nil or match_count > 1 then
+				print_error(PKG_FIND_ERROR, pkg_name)
+				exit(-1)
+			end
+			
+			cp(pkg_path, repo_path)
+		end
+	end
+
+	local function update_repo(repo_path)
+		for pkg in file_iter(repo_path) do
+			if is_full_match(pkg, PKG_RE) then
+				repo_add(join(repo_path, REPO_NAME), pkg)
+			end
+		end
+	end
+
+	local function cleanup()
+		for _, file in ipairs(FILE_CLEANUP) do
+			rm(file)
+		end
+	end
+
+	local pkg_dirs = get_package_directories(REPO_PATH)
+	--print("Extracting packages...")
+	extract_pkgs(pkg_dirs, REPO_PATH)
+	--printf("Updating repo <%s>...", REPO_NAME)
+	update_repo(REPO_PATH)
+	--print("Cleaning up temporary files...")
+	cleanup()
+end
+
+main()
